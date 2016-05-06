@@ -11,7 +11,7 @@ import octoprint.plugin.core
 
 from octoprint.settings import valid_boolean_trues
 from octoprint.server.util.flask import restricted_access
-from octoprint.server import admin_permission
+from octoprint.server import admin_permission, VERSION
 from octoprint.util.pip import PipCaller, UnknownPip
 
 from flask import jsonify, make_response
@@ -113,7 +113,20 @@ class PluginManagerPlugin(octoprint.plugin.SimpleApiPlugin,
 
 	def get_template_configs(self):
 		return [
-			dict(type="settings", name=gettext("Plugin Manager"), template="pluginmanager_settings.jinja2", custom_bindings=True)
+			dict(type="settings", name=gettext("Plugin Manager"), template="pluginmanager_settings.jinja2", custom_bindings=True),
+			dict(type="about", name="Plugin Licenses", template="pluginmanager_about.jinja2")
+		]
+
+	def get_template_vars(self):
+		plugins = sorted(self._get_plugins(), key=lambda x: x["name"].lower())
+		return dict(
+			all=plugins,
+			thirdparty=filter(lambda p: not p["bundled"], plugins)
+		)
+
+	def get_template_types(self, template_sorting, template_rules, *args, **kwargs):
+		return [
+			("about_thirdparty", dict(), dict(template=lambda x: x + "_about_thirdparty.jinja2"))
 		]
 
 	##~~ BlueprintPlugin
@@ -184,7 +197,7 @@ class PluginManagerPlugin(octoprint.plugin.SimpleApiPlugin,
 		                   plugins=self._repository_plugins
 		               ),
 		               os=self._get_os(),
-		               octoprint=self._get_octoprint_version(),
+		               octoprint=VERSION,
 		               pip=dict(
 		                   available=self._pip_caller.available,
 		                   command=self._pip_caller.command,
@@ -550,9 +563,7 @@ class PluginManagerPlugin(octoprint.plugin.SimpleApiPlugin,
 				return False
 
 		current_os = self._get_os()
-		octoprint_version = self._get_octoprint_version()
-		if "-" in octoprint_version:
-			octoprint_version = octoprint_version[:octoprint_version.find("-")]
+		octoprint_version = self._get_octoprint_version(base=True)
 
 		def map_repository_entry(entry):
 			result = dict(entry)
@@ -577,12 +588,11 @@ class PluginManagerPlugin(octoprint.plugin.SimpleApiPlugin,
 		self._repository_plugins = map(map_repository_entry, repo_data)
 		return True
 
-	def _is_octoprint_compatible(self, octoprint_version_string, compatibility_entries):
+	def _is_octoprint_compatible(self, octoprint_version, compatibility_entries):
 		"""
 		Tests if the current ``octoprint_version`` is compatible to any of the provided ``compatibility_entries``.
 		"""
 
-		octoprint_version = pkg_resources.parse_version(octoprint_version_string)
 		for octo_compat in compatibility_entries:
 			if not any(octo_compat.startswith(c) for c in ("<", "<=", "!=", "==", ">=", ">", "~=", "===")):
 				octo_compat = ">={}".format(octo_compat)
@@ -611,9 +621,42 @@ class PluginManagerPlugin(octoprint.plugin.SimpleApiPlugin,
 		else:
 			return "unknown"
 
-	def _get_octoprint_version(self):
-		from octoprint._version import get_versions
-		return get_versions()["version"]
+	def _get_octoprint_version_string(self):
+		return VERSION
+
+	def _get_octoprint_version(self, base=False):
+		octoprint_version_string = self._get_octoprint_version_string()
+
+		if "-" in octoprint_version_string:
+			octoprint_version_string = octoprint_version_string[:octoprint_version_string.find("-")]
+
+		octoprint_version = pkg_resources.parse_version(octoprint_version_string)
+		if base:
+			if isinstance(octoprint_version, tuple):
+				# old setuptools
+				base_version = []
+				for part in octoprint_version:
+					if part.startswith("*"):
+						break
+					base_version.append(part)
+				base_version.append("*final")
+				octoprint_version = tuple(base_version)
+			else:
+				# new setuptools
+				octoprint_version = pkg_resources.parse_version(octoprint_version.base_version)
+		return octoprint_version
+
+	def _get_plugins(self):
+		plugins = self._plugin_manager.plugins
+
+		hidden = self._settings.get(["hidden"])
+		result = []
+		for name, plugin in plugins.items():
+			if name in hidden:
+				continue
+			result.append(self._to_external_representation(plugin))
+
+		return result
 
 	def _to_external_representation(self, plugin):
 		return dict(
@@ -645,5 +688,6 @@ def __plugin_load__():
 
 	global __plugin_hooks__
 	__plugin_hooks__ = {
-		"octoprint.server.http.bodysize": __plugin_implementation__.increase_upload_bodysize
+		"octoprint.server.http.bodysize": __plugin_implementation__.increase_upload_bodysize,
+		"octoprint.ui.web.templatetypes": __plugin_implementation__.get_template_types
 	}

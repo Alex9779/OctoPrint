@@ -61,6 +61,7 @@ class VirtualPrinter():
 		self._selectedSdFileSize = None
 		self._selectedSdFilePos = None
 		self._writingToSd = False
+		self._writingToSdHandle = None
 		self._newSdFilePos = None
 		self._heatupThread = None
 
@@ -69,6 +70,10 @@ class VirtualPrinter():
 
 		self._sendWait = settings().getBoolean(["devel", "virtualPrinter", "sendWait"])
 		self._waitInterval = settings().getFloat(["devel", "virtualPrinter", "waitInterval"])
+
+		self._echoOnM117 = settings().getBoolean(["devel", "virtualPrinter", "echoOnM117"])
+
+		self._brokenM29 = settings().getBoolean(["devel", "virtualPrinter", "brokenM29"])
 
 		self.currentLine = 0
 		self.lastN = 0
@@ -85,6 +90,10 @@ class VirtualPrinter():
 		self._action_hooks = plugin_manager().get_hooks("octoprint.plugin.virtual_printer.custom_action")
 
 		self._killed = False
+
+		self._triggerResendAt100 = True
+		self._triggerResendWithTimeoutAt105 = True
+		self._triggeredResendWithTimeoutAt105 = False
 
 		waitThread = threading.Thread(target=self._sendWaitAfterTimeout)
 		waitThread.start()
@@ -132,7 +141,12 @@ class VirtualPrinter():
 
 			# strip checksum
 			if "*" in data:
+				checksum = int(data[data.rfind("*") + 1:])
 				data = data[:data.rfind("*")]
+				if not checksum == self._calculate_checksum(data):
+					self._triggerResend(expected=self.currentLine + 1)
+					continue
+
 				self.currentLine += 1
 			elif settings().getBoolean(["devel", "virtualPrinter", "forceChecksum"]):
 				self.outgoing.put("Error: Missing checksum")
@@ -143,6 +157,10 @@ class VirtualPrinter():
 				linenumber = int(re.search("N([0-9]+)", data).group(1))
 				self.lastN = linenumber
 				self.currentLine = linenumber
+
+				self._triggerResendAt100 = True
+				self._triggerResendWithTimeoutAt105 = True
+
 				self._sendOk()
 				continue
 			elif data.startswith("N"):
@@ -151,9 +169,17 @@ class VirtualPrinter():
 				if linenumber != expected:
 					self._triggerResend(actual=linenumber)
 					continue
-				elif self.currentLine == 101:
+				elif linenumber == 100 and self._triggerResendAt100:
 					# simulate a resend at line 100
+					self._triggerResendAt100 = False
 					self._triggerResend(expected=100)
+					continue
+				elif linenumber == 105 and self._triggerResendWithTimeoutAt105 and not self._writingToSd:
+					# simulate a resend with timeout at line 105
+					self._triggerResendWithTimeoutAt105 = False
+					self._triggerResend(expected=105)
+					self._dont_answer = True
+					self.lastN = linenumber
 					continue
 				else:
 					self.lastN = linenumber
@@ -162,9 +188,8 @@ class VirtualPrinter():
 			data += "\n"
 
 			# shortcut for writing to SD
-			if self._writingToSd and not self._selectedSdFile is None and not "M29" in data:
-				with open(self._selectedSdFile, "a") as f:
-					f.write(data)
+			if self._writingToSdHandle is not None and not "M29" in data:
+				self._writingToSdHandle.write(data)
 				self._sendOk()
 				continue
 
@@ -221,6 +246,8 @@ class VirtualPrinter():
 			elif 'M29' in data:
 				if self._sdCardReady:
 					self._finishSdFile()
+				if self._brokenM29:
+					continue
 			elif 'M30' in data:
 				if self._sdCardReady:
 					filename = data.split(None, 1)[1].strip()
@@ -234,7 +261,8 @@ class VirtualPrinter():
 				continue
 			elif "M117" in data:
 				# we'll just use this to echo a message, to allow playing around with pause triggers
-				self.outgoing.put("echo:%s" % re.search("M117\s+(.*)", data).group(1))
+				if self._echoOnM117:
+					self.outgoing.put("echo:%s" % re.search("M117\s+(.*)", data).group(1))
 			elif "M999" in data:
 				# mirror Marlin behaviour
 				self.outgoing.put("Resend: 1")
@@ -294,6 +322,12 @@ class VirtualPrinter():
 			if len(data.strip()) > 0 and not self._okBeforeCommandOutput:
 				self._sendOk()
 
+	def _calculate_checksum(self, line):
+		checksum = 0
+		for c in line:
+			checksum ^= ord(c)
+		return checksum
+
 	def _kill(self):
 		if not self._supportM112:
 			return
@@ -335,6 +369,8 @@ class VirtualPrinter():
 			self._triggerResend(expected=self.lastN)
 		elif data == "drop_connection":
 			self._debug_drop_connection = True
+		elif data == "maxtemp_error":
+			self.outgoing.put("Error: MAXTEMP triggered!")
 		else:
 			try:
 				sleep_match = VirtualPrinter.sleep_regex.match(data)
@@ -575,59 +611,89 @@ class VirtualPrinter():
 			else:
 				self.outgoing.put("error writing to file")
 
+		handle = None
+		try:
+			handle = open(file, "w")
+		except:
+			self.outgoing.put("error writing to file")
+			if handle is not None:
+				try:
+					handle.close()
+				except:
+					pass
+		self._writingToSdHandle = handle
 		self._writingToSd = True
 		self._selectedSdFile = file
 		self.outgoing.put("Writing to file: %s" % filename)
 
 	def _finishSdFile(self):
+		try:
+			self._writingToSdHandle.close()
+		except:
+			pass
+		finally:
+			self._writingToSdHandle = None
 		self._writingToSd = False
 		self._selectedSdFile = None
+		self.outgoing.put("Done saving file")
 
 	def _sdPrintingWorker(self):
 		self._selectedSdFilePos = 0
-		with open(self._selectedSdFile, "r") as f:
-			for line in iter(f.readline, ""):
-				if self._killed:
-					break
+		try:
+			with open(self._selectedSdFile, "r") as f:
+				for line in iter(f.readline, ""):
+					if self._killed:
+						break
 
-				# reset position if requested by client
-				if self._newSdFilePos is not None:
-					f.seek(self._newSdFilePos)
-					self._newSdFilePos = None
+					# reset position if requested by client
+					if self._newSdFilePos is not None:
+						f.seek(self._newSdFilePos)
+						self._newSdFilePos = None
 
-				# read current file position
-				self._selectedSdFilePos = f.tell()
+					# read current file position
+					self._selectedSdFilePos = f.tell()
 
-				# if we are paused, wait for unpausing
-				self._sdPrintingSemaphore.wait()
+					# if we are paused, wait for unpausing
+					self._sdPrintingSemaphore.wait()
 
-				# set target temps
-				if 'M104' in line or 'M109' in line:
-					self._parseHotendCommand(line)
-				if 'M140' in line or 'M190' in line:
-					self._parseBedCommand(line)
+					# set target temps
+					if 'M104' in line or 'M109' in line:
+						self._parseHotendCommand(line)
+					elif 'M140' in line or 'M190' in line:
+						self._parseBedCommand(line)
+					elif line.startswith("G0") or line.startswith("G1") or line.startswith("G2") or line.startswith("G3"):
+						# simulate reprap buffered commands via a Queue with maxsize which internally simulates the moves
+						self.buffered.put(line)
 
-				time.sleep(settings().getFloat(["devel", "virtualPrinter", "throttle"]))
+		except AttributeError:
+			if self.outgoing is not None:
+				raise
 
-		self._sdPrintingSemaphore.clear()
-		self._selectedSdFilePos = 0
-		self._sdPrinter = None
-		self.outgoing.put("Done printing file")
+		if not self._killed:
+			self._sdPrintingSemaphore.clear()
+			self._selectedSdFilePos = 0
+			self._sdPrinter = None
+			self.outgoing.put("Done printing file")
 
 	def _waitForHeatup(self, heater):
 		delta = 1
 		delay = 1
-		if heater.startswith("tool"):
-			toolNum = int(heater[len("tool"):])
-			while not self._killed and (self.temp[toolNum] < self.targetTemp[toolNum] - delta or self.temp[toolNum] > self.targetTemp[toolNum] + delta):
-				self._simulateTemps(delta=delta)
-				self.outgoing.put("T:%0.2f" % self.temp[toolNum])
-				time.sleep(delay)
-		elif heater == "bed":
-			while not self._killed and (self.bedTemp < self.bedTargetTemp - delta or self.bedTemp > self.bedTargetTemp + delta):
-				self._simulateTemps(delta=delta)
-				self.outgoing.put("B:%0.2f" % self.bedTemp)
-				time.sleep(delay)
+
+		try:
+			if heater.startswith("tool"):
+				toolNum = int(heater[len("tool"):])
+				while not self._killed and (self.temp[toolNum] < self.targetTemp[toolNum] - delta or self.temp[toolNum] > self.targetTemp[toolNum] + delta):
+					self._simulateTemps(delta=delta)
+					self.outgoing.put("T:%0.2f" % self.temp[toolNum])
+					time.sleep(delay)
+			elif heater == "bed":
+				while not self._killed and (self.bedTemp < self.bedTargetTemp - delta or self.bedTemp > self.bedTargetTemp + delta):
+					self._simulateTemps(delta=delta)
+					self.outgoing.put("B:%0.2f" % self.bedTemp)
+					time.sleep(delay)
+		except AttributeError:
+			if self.outgoing is not None:
+				raise
 
 	def _deleteSdFile(self, filename):
 		if filename.startswith("/"):
@@ -692,12 +758,12 @@ class VirtualPrinter():
 
 		try:
 			line = self.outgoing.get(timeout=self._read_timeout)
-			time.sleep(settings().getFloat(["devel", "virtualPrinter", "throttle"]))
 			return line
 		except Queue.Empty:
 			return ""
 
 	def close(self):
+		self._killed = True
 		self.incoming = None
 		self.outgoing = None
 		self.buffered = None

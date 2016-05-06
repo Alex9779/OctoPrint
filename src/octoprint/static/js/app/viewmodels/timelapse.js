@@ -26,13 +26,17 @@ $(function() {
         self.isReady = ko.observable(undefined);
         self.isLoading = ko.observable(undefined);
 
-        self.timelapseTypeSelected = ko.computed(function() {
+        self.isBusy = ko.pureComputed(function() {
+            return self.isPrinting() || self.isPaused();
+        });
+
+        self.timelapseTypeSelected = ko.pureComputed(function() {
             return ("off" != self.timelapseType());
         });
-        self.intervalInputEnabled = ko.computed(function() {
+        self.intervalInputEnabled = ko.pureComputed(function() {
             return ("timed" == self.timelapseType());
         });
-        self.saveButtonEnabled = ko.computed(function() {
+        self.saveButtonEnabled = ko.pureComputed(function() {
             return self.isDirty() && self.isOperational() && !self.isPrinting() && self.loginState.isUser();
         });
 
@@ -87,9 +91,40 @@ $(function() {
             CONFIG_TIMELAPSEFILESPERPAGE
         );
 
+        // initialize list helper for unrendered timelapses
+        self.unrenderedListHelper = new ItemListHelper(
+            "unrenderedTimelapseFiles",
+            {
+                "name": function(a, b) {
+                    // sorts ascending
+                    if (a["name"].toLocaleLowerCase() < b["name"].toLocaleLowerCase()) return -1;
+                    if (a["name"].toLocaleLowerCase() > b["name"].toLocaleLowerCase()) return 1;
+                    return 0;
+                },
+                "creation": function(a, b) {
+                    // sorts descending
+                    if (a["date"] > b["date"]) return -1;
+                    if (a["date"] < b["date"]) return 1;
+                    return 0;
+                },
+                "size": function(a, b) {
+                    // sorts descending
+                    if (a["bytes"] > b["bytes"]) return -1;
+                    if (a["bytes"] < b["bytes"]) return 1;
+                    return 0;
+                }
+            },
+            {
+            },
+            "name",
+            [],
+            [],
+            CONFIG_TIMELAPSEFILESPERPAGE
+        );
+
         self.requestData = function() {
             $.ajax({
-                url: API_BASEURL + "timelapse",
+                url: API_BASEURL + "timelapse?unrendered=true",
                 type: "GET",
                 dataType: "json",
                 success: self.fromResponse
@@ -102,6 +137,9 @@ $(function() {
 
             self.timelapseType(config.type);
             self.listHelper.updateItems(response.files);
+            if (response.unrendered) {
+                self.unrenderedListHelper.updateItems(response.unrendered);
+            }
 
             if (config.type == "timed") {
                 if (config.interval != undefined && config.interval > 0) {
@@ -159,6 +197,25 @@ $(function() {
                 type: "DELETE",
                 dataType: "json",
                 success: self.requestData
+            });
+        };
+
+        self.removeUnrendered = function(name) {
+            $.ajax({
+                url: API_BASEURL + "timelapse/unrendered/" + name,
+                type: "DELETE",
+                dataType: "json",
+                success: self.requestData
+            });
+        };
+
+        self.renderUnrendered = function(name) {
+            $.ajax({
+                url: API_BASEURL + "timelapse/unrendered/" + name,
+                type: "POST",
+                dataType: "json",
+                contentType: "application/json; charset=UTF-8",
+                data: JSON.stringify({command: "render"})
             });
         };
 

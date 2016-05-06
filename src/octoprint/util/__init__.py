@@ -18,6 +18,7 @@ import threading
 from functools import wraps
 import warnings
 import contextlib
+import Queue as queue
 
 logger = logging.getLogger(__name__)
 
@@ -372,6 +373,11 @@ def to_unicode(s_or_u, encoding="utf-8", errors="strict"):
 		return s_or_u
 
 
+def is_running_from_source():
+	root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+	return os.path.isdir(os.path.join(root, "src")) and os.path.isfile(os.path.join(root, "setup.py"))
+
+
 def dict_merge(a, b):
 	"""
 	Recursively deep-merges two dictionaries.
@@ -541,6 +547,48 @@ def dict_contains_keys(keys, dictionary):
 				return False
 
 	return True
+
+
+def dict_filter(dictionary, filter_function):
+	"""
+	Filters a dictionary with the provided filter_function
+
+	Example::
+
+	    >>> data = dict(key1="value1", key2="value2", other_key="other_value", foo="bar", bar="foo")
+	    >>> dict_filter(data, lambda k, v: k.startswith("key")) == dict(key1="value1", key2="value2")
+	    True
+	    >>> dict_filter(data, lambda k, v: v.startswith("value")) == dict(key1="value1", key2="value2")
+	    True
+	    >>> dict_filter(data, lambda k, v: k == "foo" or v == "foo") == dict(foo="bar", bar="foo")
+	    True
+	    >>> dict_filter(data, lambda k, v: False) == dict()
+	    True
+	    >>> dict_filter(data, lambda k, v: True) == data
+	    True
+	    >>> dict_filter(None, lambda k, v: True)
+	    Traceback (most recent call last):
+	        ...
+	    AssertionError
+	    >>> dict_filter(data, None)
+	    Traceback (most recent call last):
+	        ...
+	    AssertionError
+
+	Arguments:
+	    dictionary (dict): The dictionary to filter
+	    filter_function (callable): The filter function to apply, called with key and
+	        value of an entry in the dictionary, must return ``True`` for values to
+	        keep and ``False`` for values to strip
+
+	Returns:
+	    dict: A shallow copy of the provided dictionary, stripped of the key-value-pairs
+	        for which the ``filter_function`` returned ``False``
+	"""
+	assert isinstance(dictionary, dict)
+	assert callable(filter_function)
+	return dict((k, v) for k, v in dictionary.items() if filter_function(k, v))
+
 
 class Object(object):
 	pass
@@ -774,12 +822,9 @@ class RepeatedTimer(threading.Thread):
 
 class CountedEvent(object):
 
-	def __init__(self, value=0, max=None, name=None):
-		logger_name = __name__ + ".CountedEvent" + (".{name}".format(name=name) if name is not None else "")
-		self._logger = logging.getLogger(logger_name)
-
+	def __init__(self, value=0, maximum=None, **kwargs):
 		self._counter = 0
-		self._max = max
+		self._max = kwargs.get("max", maximum)
 		self._mutex = threading.Lock()
 		self._event = threading.Event()
 
@@ -804,17 +849,14 @@ class CountedEvent(object):
 			return self._counter == 0
 
 	def _internal_set(self, value):
-		self._logger.debug("New counter value: {value}".format(value=value))
 		self._counter = value
 		if self._counter <= 0:
 			self._counter = 0
 			self._event.clear()
-			self._logger.debug("Cleared event")
 		else:
 			if self._max is not None and self._counter > self._max:
 				self._counter = self._max
 			self._event.set()
-			self._logger.debug("Set event")
 
 
 class InvariantContainer(object):
@@ -848,3 +890,43 @@ class InvariantContainer(object):
 
 	def __iter__(self):
 		return self._data.__iter__()
+
+
+class TypedQueue(queue.Queue):
+
+	def __init__(self, maxsize=0):
+		queue.Queue.__init__(self, maxsize=maxsize)
+		self._lookup = set()
+
+	def put(self, item, item_type=None, *args, **kwargs):
+		queue.Queue.put(self, (item, item_type), *args, **kwargs)
+
+	def get(self, *args, **kwargs):
+		item, _ = queue.Queue.get(self, *args, **kwargs)
+		return item
+
+	def _put(self, item):
+		_, item_type = item
+		if item_type is not None:
+			if item_type in self._lookup:
+				raise TypeAlreadyInQueue(item_type, "Type {} is already in queue".format(item_type))
+			else:
+				self._lookup.add(item_type)
+
+		queue.Queue._put(self, item)
+
+	def _get(self):
+		item = queue.Queue._get(self)
+		_, item_type = item
+
+		if item_type is not None:
+			self._lookup.discard(item_type)
+
+		return item
+
+
+class TypeAlreadyInQueue(Exception):
+	def __init__(self, t, *args, **kwargs):
+		Exception.__init__(self, *args, **kwargs)
+		self.type = t
+
